@@ -5,6 +5,7 @@ import logging
 import random
 import sys
 import time
+import html as html_lib
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Set, Tuple
 
@@ -288,8 +289,23 @@ def build_search_params(args: argparse.Namespace, query: str, page: int) -> Dict
 def parse_description(html: str) -> str:
     if not html:
         return "—"
-    soup = BeautifulSoup(html, "html.parser")
-    return soup.get_text("\n", strip=True) or "—"
+
+    # 1️⃣ Явно декодируем HTML entities
+    html = html_lib.unescape(html)
+
+    # 2️⃣ Используем lxml (или html.parser, но после unescape)
+    soup = BeautifulSoup(html, "lxml")
+
+    text = soup.get_text("\n", strip=True)
+    return text if text else "—"
+
+def safe_text(val: Any) -> str:
+    if not val:
+        return "—"
+    if isinstance(val, str):
+        return val.strip()
+    return str(val).strip() or "—"
+
 
 
 def format_salary(salary: Optional[Dict[str, Any]]) -> str:
@@ -442,29 +458,34 @@ def iter_vacancy_rows(
         max_pages = min(args.page_count, max(1, pages_int))
         logger.info(f"  pages: {pages_int}, fetching up to: {max_pages}")
 
-        # helper to process items
-        def process_items(items: Any, fetched_details: int) -> int:
+        fetched_details = 0
+
+        def yield_from_items(items: Any) -> Iterator[VacancyRow]:
+            nonlocal fetched_details
+
             if not isinstance(items, list):
-                return fetched_details
+                return
+
             for item in items:
                 if not isinstance(item, dict):
                     continue
+
                 vid = item.get("id")
                 if not vid:
                     continue
-                vid = str(vid)
 
-                if vid in seen_ids:
+                vid_str = str(vid)
+                if vid_str in seen_ids:
                     continue
-                seen_ids.add(vid)
+                seen_ids.add(vid_str)
 
                 # safety fuse per query
                 if args.max_details and fetched_details >= args.max_details:
                     logger.warning(f"  Reached --max-details={args.max_details} for query {query!r}. Stop details.")
-                    return fetched_details
+                    return
 
-                detail_url = f"{HH_API_URL}/{vid}"
-                logger.info(f"    detail {vid} ...")
+                detail_url = f"{HH_API_URL}/{vid_str}"
+                logger.info(f"    detail {vid_str} ...")
                 detail = safe_get_json(session, limiter, detail_url, params=None, logger=logger)
                 fetched_details += 1
 
@@ -473,7 +494,7 @@ def iter_vacancy_rows(
                 title = str(detail.get("name") or "—").strip() or "—"
                 company = str(employer.get("name") or "—").strip() or "—"
 
-                row = VacancyRow(
+                yield VacancyRow(
                     query=query,
                     title=title,
                     company=company,
@@ -487,86 +508,24 @@ def iter_vacancy_rows(
                     description=parse_description(str(detail.get("description") or "")),
                 )
 
-                yield row  # type: ignore[misc]
                 time.sleep(max(0.0, args.detail_throttle))
-            return fetched_details
 
-        # 2) process first page items
-        fetched_details = 0
-        items0 = search_data.get("items", [])
-        # NOTE: process_items yields; we need to iterate it properly
-        for r in process_items(items0, fetched_details):  # type: ignore[arg-type]
-            # unreachable; kept only to satisfy type-checkers if ever used incorrectly
-            pass
-
-        # Because process_items is a nested generator-yielder, we must actually run it differently:
-        # We'll use a small wrapper below instead.
-
-        # ---- Correct execution wrapper (no hidden bugs) ----
-        def yield_from_items(items: Any, fetched: int) -> Tuple[Iterator[VacancyRow], int]:
-            def gen() -> Iterator[VacancyRow]:
-                nonlocal fetched
-                if not isinstance(items, list):
-                    return
-                for item in items:
-                    if not isinstance(item, dict):
-                        continue
-                    vid = item.get("id")
-                    if not vid:
-                        continue
-                    vid_str = str(vid)
-                    if vid_str in seen_ids:
-                        continue
-                    seen_ids.add(vid_str)
-
-                    if args.max_details and fetched >= args.max_details:
-                        logger.warning(f"  Reached --max-details={args.max_details} for query {query!r}. Stop details.")
-                        return
-
-                    detail_url = f"{HH_API_URL}/{vid_str}"
-                    logger.info(f"    detail {vid_str} ...")
-                    detail = safe_get_json(session, limiter, detail_url, params=None, logger=logger)
-                    fetched += 1
-
-                    contacts = detail.get("contacts") if isinstance(detail.get("contacts"), dict) else None
-                    employer = detail.get("employer") if isinstance(detail.get("employer"), dict) else {}
-                    title = str(detail.get("name") or "—").strip() or "—"
-                    company = str(employer.get("name") or "—").strip() or "—"
-
-                    yield VacancyRow(
-                        query=query,
-                        title=title,
-                        company=company,
-                        inn=extract_inn(detail),
-                        salary=format_salary(detail.get("salary") if isinstance(detail.get("salary"), dict) else None),
-                        skills=format_skills(detail.get("key_skills") or []),
-                        link=str(detail.get("alternate_url") or "").strip(),
-                        contact_person=extract_person_name(contacts),
-                        contacts=format_contacts(contacts),
-                        owner=extract_owner(detail),
-                        description=parse_description(str(detail.get("description") or "")),
-                    )
-
-                    time.sleep(max(0.0, args.detail_throttle))
-            return gen(), fetched
-
-        # run for page 0
-        gen0, fetched_details = yield_from_items(search_data.get("items", []), fetched_details)
-        for row in gen0:
+        # page 0
+        for row in yield_from_items(search_data.get("items", [])):
             yield row
 
-        # 3) remaining pages
+        # remaining pages
         for page in range(1, max_pages):
             params = build_search_params(args, query=query, page=page)
             logger.info(f"  page {page + 1}/{max_pages} ...")
             data = safe_get_json(session, limiter, HH_API_URL, params=params, logger=logger)
             time.sleep(max(0.0, args.search_throttle))
 
-            genp, fetched_details = yield_from_items(data.get("items", []), fetched_details)
-            for row in genp:
+            for row in yield_from_items(data.get("items", [])):
                 yield row
 
         logger.info(f"  done query {query!r} (unique vacancies so far: {len(seen_ids)})")
+
 
 
 def write_csv_stream(path: str, rows: Iterable[VacancyRow], verbose: bool) -> int:

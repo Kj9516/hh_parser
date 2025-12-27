@@ -1,2 +1,4 @@
-requests
-beautifulsoup4
+requests>=2.31
+beautifulsoup4>=4.12
+lxml>=4.9
+urllib3>=2.0
