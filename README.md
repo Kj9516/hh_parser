@@ -166,6 +166,3 @@ python hh_parser.py -v --queries-file queries.txt \
 python hh_parser.py -v --queries-file queries.txt --max-details 80 -o vacancies.csv
 ```
 
----
-
-Если хочешь — добавлю в README блок “Как подобрать коды specialization/industry” и пару готовых команд для твоего кейса (финдир/управленческий учет/удалёнка) прямо как шаблоны.
